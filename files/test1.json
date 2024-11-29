@@ -3,13 +3,17 @@
   "adios": "Fallows",
   "victoria": 33.3,
   "nano": true,
-  "coso": [2,3,4,{}],
+  "coso": [2, 3, 4, {}],
   "objecto": {
     "array": [
       12,
       13,
       14,
       15,
+      null,
+      {},
+      [],
+      [[[]]],
       {
         "super_interno": 007
       }

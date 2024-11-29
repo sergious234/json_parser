@@ -1,5 +1,4 @@
 use parser::JsonParser;
-use tokenizer::{JsonTokenizer, Token, TokenType};
 
 mod tokenizer {
     use std::{
@@ -20,6 +19,7 @@ mod tokenizer {
         LCurly,
         RCurly,
         White,
+        Null,
         Text(String),
         EOF,
     }
@@ -38,6 +38,7 @@ mod tokenizer {
         RCurly,
         White,
         Text,
+        Null,
         EOF,
     }
 
@@ -55,6 +56,7 @@ mod tokenizer {
                 Token::RCurly => TokenType::RCurly,
                 Token::White => TokenType::White,
                 Token::Text(_) => TokenType::Text,
+                Token::Null => TokenType::Null,
                 Token::EOF => TokenType::EOF,
             }
         }
@@ -77,33 +79,9 @@ mod tokenizer {
         pub fn next_token(&mut self) -> Option<Token> {
             self.lexer.next_token()
         }
-
-        fn tokenize(c: &str) -> Option<Token> {
-            match c {
-                "[" => Some(Token::LBracket),
-                "]" => Some(Token::RBracket),
-                "{" => Some(Token::LCurly),
-                "}" => Some(Token::RCurly),
-                "true" => Some(Token::Bool(true)),
-                "false" => Some(Token::Bool(false)),
-                ":" => Some(Token::Colon),
-                "," => Some(Token::Comma),
-                s if s.starts_with('"') && s.ends_with('"') && s.len() > 2 => {
-                    Some(Token::String(s.to_owned()))
-                }
-                s if s.trim().is_empty() => Some(Token::White),
-                s => {
-                    if let Ok(n) = s.parse::<f64>() {
-                        Some(Token::Num(n))
-                    } else {
-                        None
-                    }
-                }
-            }
-        }
     }
 
-    pub struct Lexer<R: Read> {
+    struct Lexer<R: Read> {
         bytes: Peekable<Bytes<R>>,
         buff: Option<char>,
         pub position: usize,
@@ -124,6 +102,7 @@ mod tokenizer {
             match str {
                 "true" => Some(Token::Bool(true)),
                 "false" => Some(Token::Bool(false)),
+                "null" => Some(Token::Null),
                 _ => Some(Token::Text(str.to_string())),
             }
         }
@@ -135,8 +114,13 @@ mod tokenizer {
                 let c = self.get_next_char()?;
                 if c == '"' {
                     return Some(Token::String(name.to_string()));
+                } else if c == '\\' {
+                    name.push(c);
+                    let c = self.get_next_char()?;
+                    name.push(c)
+                } else {
+                    name.push(c)
                 }
-                name.push(c)
             }
         }
 
@@ -235,7 +219,7 @@ mod tokenizer {
 mod parser {
     use std::{collections::HashMap, io::Read};
 
-    use crate::tokenizer::{JsonTokenizer, Lexer, Token, TokenType};
+    use crate::tokenizer::{JsonTokenizer, Token, TokenType};
 
     type Result<T> = std::result::Result<T, String>;
 
@@ -247,6 +231,7 @@ mod parser {
         Number(f64),
         String(String),
         Bool(bool),
+        Null,
     }
 
     pub struct JsonParser<R: Read> {
@@ -276,23 +261,24 @@ mod parser {
                 Ok(old_token)
             } else {
                 Err(format!(
-                    "Error, expectec {token_type:?} got {:?}",
-                    self.next_token.kind()
+                    "Error, expected {token_type:?} got {:?} at position {:?}",
+                    self.next_token.kind(),
+                    self.tokenizer.get_position()
                 ))
             }
         }
 
         pub fn parse(mut self) -> Result<ASTElement> {
-            match self.next_token {
-                Token::LCurly => {
+            match self.next_token.kind() {
+                TokenType::LCurly => {
                     self.match_token(TokenType::LCurly)?;
                     self.parse_object()
                 }
-                Token::LBracket => {
+                TokenType::LBracket => {
                     self.match_token(TokenType::LBracket)?;
                     self.parse_array()
                 }
-                _ => panic!("Error parsing"),
+                _ => Err("Error parsing".to_string())?,
             }
         }
 
@@ -304,9 +290,19 @@ mod parser {
                 unreachable!();
             };
 
-            if self.next_token.kind() == TokenType::RCurly {
-                self.match_token(TokenType::RCurly)?;
-                return Ok(object);
+            match self.next_token.kind() {
+                TokenType::RBracket => {
+                    Err(format!(
+                        "Expected field name, got ']' at position {:?}. Maybe wanted to close object and used ']' instead of '}}' ?",
+                        self.tokenizer.get_position()
+                        )
+                    )?
+                }
+                TokenType::RCurly => {
+                    self.match_token(TokenType::RCurly)?;
+                    return Ok(object);
+                }
+                _ => {}
             }
 
             let (field_name, value) = self.parse_field()?;
@@ -324,9 +320,18 @@ mod parser {
                 unreachable!();
             };
 
-            if self.next_token.kind() == TokenType::RCurly {
-                self.match_token(TokenType::RCurly)?;
-                return Ok(object);
+            match self.next_token.kind() {
+                TokenType::RBracket => {Err(format!(
+                        "Expected field name, got ']' at position {:?}. Maybe wanted to close object and used ']' instead of '}}' ?",
+                        self.tokenizer.get_position()
+                        )
+                    )?
+                }
+                TokenType::RCurly => {
+                    self.match_token(TokenType::RCurly)?;
+                    return Ok(object);
+                }
+                _ => {}
             }
 
             self.match_token(TokenType::Comma)?;
@@ -338,21 +343,33 @@ mod parser {
         }
 
         pub fn parse_field(&mut self) -> Result<(String, ASTElement)> {
-            let field_name = match &self.next_token {
-                Token::String(f_name) => {
-                    let field_name = f_name.clone();
-                    self.match_token(TokenType::String)?;
+            let field_name = match self.next_token.kind() {
+                TokenType::String => {
+                    let field_name =
+                        if let Token::String(s) = self.match_token(TokenType::String)? {
+                            s
+                        } else {
+                            unreachable!();
+                        };
                     self.match_token(TokenType::Colon)?;
                     field_name
                 }
-                _ => Err("Expected field name".to_string())?,
+                other => Err(format!(
+                    "Expected field name, got {other:?} at position {:?}",
+                    self.tokenizer.get_position()
+                ))?,
             };
 
-            let value = match self.next_token.kind() {
+            let value = self.parse_value()?;
+            Ok((field_name, value))
+        }
+
+        fn parse_value(&mut self) -> Result<ASTElement> {
+            match self.next_token.kind() {
                 TokenType::String => {
                     let old = self.match_token(TokenType::String)?;
                     if let Token::String(v) = old {
-                        ASTElement::String(v)
+                        Ok(ASTElement::String(v))
                     } else {
                         unreachable!()
                     }
@@ -361,7 +378,7 @@ mod parser {
                 TokenType::Num => {
                     let old = self.match_token(TokenType::Num)?;
                     if let Token::Num(v) = old {
-                        ASTElement::Number(v)
+                        Ok(ASTElement::Number(v))
                     } else {
                         unreachable!()
                     }
@@ -370,82 +387,63 @@ mod parser {
                 TokenType::Bool => {
                     let old = self.match_token(TokenType::Bool)?;
                     if let Token::Bool(v) = old {
-                        ASTElement::Bool(v)
+                        Ok(ASTElement::Bool(v))
                     } else {
                         unreachable!()
                     }
                 }
 
+                TokenType::Null => {
+                    self.match_token(TokenType::Null)?;
+                    Ok(ASTElement::Null)
+                }
+
                 TokenType::LBracket => {
                     self.match_token(TokenType::LBracket)?;
-                    self.parse_array()?
+                    self.parse_array()
                 }
 
                 TokenType::LCurly => {
                     self.match_token(TokenType::LCurly)?;
-                    self.parse_object()?
+                    self.parse_object()
                 }
 
                 other => Err(format!("Expected field value, found {other:?}"))?,
-            };
-            Ok((field_name, value))
+            }
         }
 
         pub fn parse_array(&mut self) -> Result<ASTElement> {
             let list = ASTElement::List(vec![]);
+
+            match self.next_token.kind() {
+                TokenType::RCurly => {Err(format!(
+                        "Expected field name, got '}}' at position {:?}. Maybe wanted to close array and used '}}' instead of ']' ?",
+                        self.tokenizer.get_position()
+                        )
+                    )?
+                }
+                TokenType::RBracket => {
+                    self.match_token(TokenType::RBracket)?;
+                    return Ok(list);
+                }
+                _ => {}
+            }
             self.parse_next_array_element(list)
         }
 
         pub fn parse_next_array_element(&mut self, mut list: ASTElement) -> Result<ASTElement> {
             if let ASTElement::List(ref mut v) = list {
-                match &self.next_token {
-                    Token::String(s) => {
-                        let copy = s.clone();
-                        self.match_token(TokenType::String)?;
-                        v.push(ASTElement::String(copy));
-                    }
-
-                    Token::LCurly => {
-                        self.match_token(TokenType::LCurly)?;
-                        let object = self.parse_object()?;
-                        v.push(object);
-                    }
-
-                    Token::LBracket => {
-                        self.match_token(TokenType::LBracket)?;
-                        let in_list = self.parse_array()?;
-                        v.push(in_list);
-                    }
-
-                    Token::RBracket => Err(format!(
-                        "Failed to parse array, trailing comma detected in position: {:?}",
-                        self.tokenizer.get_position()
-                    ))?,
-
-                    Token::Bool(b) => {
-                        v.push(ASTElement::Bool(*b));
-                        self.match_token(TokenType::Bool)?;
-                    }
-
-                    Token::Num(n) => {
-                        v.push(ASTElement::Number(*n));
-                        self.match_token(TokenType::Num)?;
-                    }
-
-                    //Token::Comma => {
-                    //    Err(format!("Failed to parse array, trailing comma detected in position: {}", self.tokenizer.get_position()))?
-                    //}
-                    other => Err(format!("Failed to parse array, found: {other:?}"))?,
-                };
+                let value = self.parse_value()?;
+                v.push(value)
             }
 
-            match &self.next_token {
-                Token::Comma => {
+            match &self.next_token.kind() {
+                TokenType::Comma => {
                     self.match_token(TokenType::Comma)?;
                     self.parse_next_array_element(list)
                 }
 
-                Token::RBracket => {
+                TokenType::RBracket => {
                     self.match_token(TokenType::RBracket)?;
                     Ok(list)
                 }
@@ -459,7 +457,7 @@ mod parser {
 }
 
 fn main() {
-    let reader = std::fs::File::open("files/test3.json").unwrap();
+    let reader = std::fs::File::open("files/large-file.json").unwrap();
     let parser = JsonParser::new(reader);
     let ast = parser.parse();
     println!("{ast:?}")
@@ -469,13 +467,12 @@ fn main() {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test4() {
         let reader = std::fs::File::open("files/test4.json").unwrap();
         let parser = JsonParser::new(reader);
         let ast = parser.parse();
-        assert!(ast.is_err())
+        assert!(ast.is_ok())
     }
 
     #[test]
